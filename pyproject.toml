@@ -1,0 +1,48 @@
+[project]
+name = "jev-plays-pokemon"
+version = "0.1.0"
+description = "TypeSafe Jev plays Pokemon Red via PyBoy"
+authors = [
+    { name = "Milan Boers", email = "mail@milanboers.nl" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "pillow>=12.3.0",
+    "pyboy>=2.7.0",
+    "python-dotenv>=1.2.3",
+    "typesafe-sdk>=0.6.0",
+]
+
+[project.scripts]
+jev-plays-pokemon = "jev_plays_pokemon.main:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+markers = ["integration: requires the Pokemon Red ROM and PyBoy"]
+
+[tool.ruff]
+line-length = 110
+exclude = ["jev_plays_pokemon/vendor/**"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+ignore = ["B008"]
+
+[tool.ruff.lint.per-file-ignores]
+# state.py embeds a long prompt string for the model.
+"jev_plays_pokemon/state.py" = ["E501"]
+
+[build-system]
+requires = ["uv_build>=0.12.13,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "jev_plays_pokemon"
+module-root = ""
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.16.8",
+]

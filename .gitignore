@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+*.egg-info
+.pytest_cache/
+
+# Virtual environments
+.venv
+
+# Secrets
+.env
+
+# Game ROMs (copyrighted material — not committed)
+roms/*.gb
+roms/*.gbc
+
+# Generated output
+screenshots/
+logs/
+.ruff_cache/

@@ -1,0 +1,41 @@
+MIT License
+
+Copyright (c) 2026 Milan Boers
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF THIRD-PARTY RIGHTS.
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+DAMAGES OR OTHER LIABILITY ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+--------------------------------------------------------------------------
+
+Third-party code
+
+The `jev_plays_pokemon/vendor/` directory contains code vendored from other
+MIT-licensed open-source projects, which retains its original license terms:
+
+- PyBoy (https://github.com/Baekalfen/PyBoy) — Copyright (c) PyBoy authors, MIT
+  License. The intro-navigation logic in `intro.py` is a port of PyBoy's
+  `GameWrapperPokemonGen1.start_game`.
+- pokemon-agent (https://github.com/NousResearch/pokemon-agent) — Copyright (c)
+  Nous Research, MIT License. Vendored: the emulator wrapper, the Red/Blue RAM
+  reader, the collision map, and the state builder.
+- ClaudePlaysPokemonStarter (https://github.com/davidhershey/ClaudePlaysPokemonStarter) —
+  no code vendored; the screen-relative navigation approach in `screen_grid.py`
+  is a from-scratch reimplementation inspired by this project.
+
+This project does not distribute any game ROMs, game artwork, or other
+copyrighted Nintendo material. You must provide your own legally obtained
+copy of the game ROM.
