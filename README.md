@@ -8,9 +8,11 @@ A small autonomous Pokémon Red agent. It uses [TypeSafe's System One model, Jev
 
 **Jev has no vision.** It can't see the screen or write text. Instead, every turn we build a compact text snapshot of the game: the on-screen dialog, a walkability map read from RAM, your party/bag/battle state, the room layout learned so far, and a short-term objective. Jev answers *parallel yes/no questions* ("is pressing A the best action right now?", "is walking UP best?") and the code picks the strongest, safest button press.
 
+**Jev has no conversation history.** Unlike an LLM in a chatbot, Jev doesn't get a growing transcript of past turns — each turn is a fresh, self-contained request. Whatever Jev needs to know about the past has to be *in* that request, so the harness itself does the remembering: it keeps a short-term memory (recent dialog pages, recent high-level actions, the explored fraction of the current room) and re-injects it into every snapshot. Jev decides only from what it sees in the current turn; continuity comes from the harness, not the model.
+
 ## What it can do
 
-- Plays through the intro automatically (title → NEW GAME → names RED), fast-forwarded.
+- Plays through the intro automatically (title → NEW GAME → names RED → names the rival), fast-forwarded.
 - Reads Pokémon Red's RAM directly: location, facing, money, badges, party (species/level/HP/status/types/moves), bag, battle state, and story flags.
 - Decodes the on-screen dialog box / menu text from the emulator's tilemaps (e.g. `FIGHT PKMN BAG RUN`, `POKéMON ITEM RED SAVE`).
 - Reads the game's **object memory** (WRAM `0xC100`/`0xC200`) to list nearby people/objects: their **identity** (Mom, Oak, Girl, Poke Ball…), **screen cell**, and **direction/distance from you** — so it can walk up to an NPC and talk instead of wandering blind.
@@ -18,10 +20,11 @@ A small autonomous Pokémon Red agent. It uses [TypeSafe's System One model, Jev
 - Picks a **high-level goal each turn** (`talk to Mom`, `explore`, `leave the room`, `advance text`); code executes it with A* pathfinding. In menus/battles Jev picks individual buttons, with deterministic safeguards:
   - flattened goal sampling (a confident pick fires ~60–70% of the time, so it never hard-locks on one goal),
   - confidence/margin gating on menu/battle buttons (falls back to advancing dialog or waiting when unsure),
-  - learned wall memory (never walks into a wall twice),
+  - live collision grid only (a bump or NPC never becomes a permanent wall),
   - anti-pacing (never immediately reverses the last step),
   - stuck detection (press B → wait → re-route),
   - exit probing when a room is fully explored (exits/stairs are "walls" the game lets you walk through).
+- **Today it reliably plays the opening sequence end-to-end**: walks out of the house, talks to people, follows Oak to his lab, picks a starter (and declines the nickname), and steps back out into Pallet Town.
 - Shows a live SDL2 window so you can watch it play.
 
 ## Project layout
@@ -87,8 +90,8 @@ turn 12 | Red's House 1F (6,5) facing up | open:dlr | Deliver Oak's Parcel... | 
 ```
 
 The same session is also written verbosely to `logs/run_<timestamp>.log`
-(full room map, screen text, per-button frame counts, learned walls, stuck
-alerts — everything), so you can reconstruct a whole run later. Pass
+(full room map, screen text, per-button frame counts, stuck alerts —
+everything), so you can reconstruct a whole run later. Pass
 `--verbose` to also see that detail on stdout. Screenshots land in
 `screenshots/` (one PNG per turn).
 
@@ -122,11 +125,20 @@ In menus and battles Jev instead picks a single button via the 8 atomic Nouls.
 Deterministic safeguards remain: wall memory, anti-pacing, stuck detection.
 
 **State** (what Jev reads every turn): a short instruction block (how to read
-the state, priority order, Gen 1 battle type chart), the decoded screen text,
-the walkability map, `walkable_directions`, the room map, **nearby objects**
+the state, priority order, Gen 1 battle type chart, the long-term goal of
+earning all 8 gym badges), the decoded screen text, the walkability map,
+`walkable_directions`, the room map with `explored_fraction` (how much of the
+room has been seen, so Jev knows when to stop exploring), **nearby objects**
 (who is on the current map and where, e.g. `Mom: at C8 (2 tiles WEST, 3 tiles
-SOUTH)`), the available **goals**, player/party/bag/battle/flags, the current
-objective, and the last few actions.
+SOUTH)`), the available **goals**, player/party/bag/battle/flags, and a
+**short-term memory**: up to 8 deduplicated dialog pages people told you
+(`recent_hints`, kept after the text box closes) and the last 12 high-level
+actions you took with their outcomes (`recent_actions`, e.g. `talked to Mom ->
+talked (A pressed)`). Both are ordered oldest → newest, so the model knows
+which entry is "just now". The screen text itself is only ever the current frame —
+the hints are how dialog survives across turns. There is no hardcoded
+per-turn objective: Jev infers the next step from dialog hints, recent
+actions, and the explored fraction.
 
 **Exits are walls.** Front doors and stairs look like solid walls (`#`) on the
 collision map — the game transitions when you step onto them. The agent knows
@@ -151,12 +163,13 @@ standing on the carpet mat).
   The engine's ▼ "awaiting input" arrow gates hint capture, which usually but
   not always lands on a clean page. The model still gets the current `screen_text`
   every turn even when the *remembered* hint is imperfect.
-- **NPC dialogue is remembered once per visit.** Talking to an NPC suppresses
-  re-offering it until you leave and re-enter the map (which is when multi-stage
-  dialogue advances anyway). You will not get a second line from the same NPC
-  by talking to them twice in a row.
+- **Talk goals are never hard-removed.** Talking to an NPC once does not hide
+  the option — the agent decides whether to re-talk based on `recent_actions`
+  (what it just did), the anti-loop guidance, and the goal distribution. A
+  short expiring cooldown only nudges away from instantly repeating a failed
+  attempt.
 - **Non-deterministic goal choice (by design).** Goal probabilities are sampled
-  after a mild flattening (temperature 2.0, floor 0.05). So a confident pick
+  after a mild flattening (temperature 2.0, floor 0.1). So a confident pick
   fires only ~60–70% of the time, and the agent always keeps some chance of
   doing something else. This prevents hard loops but means behavior varies run
   to run, and sometimes the agent picks a clearly sub-optimal goal.
@@ -164,11 +177,16 @@ standing on the carpet mat).
   Ball, Pokedex, …) alongside NPCs and they get a `talk_to_*` goal. That is
   deliberate for Oak's Lab (you talk to the Poke Ball to pick a starter), but
   pressing A on other items may do nothing.
-- **Tutorial-area tuned.** Navigation, exits, and the intro are tuned and tested
-  for the opening sequence: Red's house → Pallet Town → Oak's Lab → starter
-  choice. Wild battles, route encounters, gym leaders and later towns are
-  mechanically supported (battle menu micro-decisions, badges objective) but
-  far less battle-tested.
+- **Battles are the current weak spot.** The opening sequence works end-to-end
+  (house → Pallet → Oak's Lab → starter → back outside), but the first rival
+  battle (and wild battles generally) are not reliable yet: the battle menu
+  micro-decisions, move selection, and run/fight flow are still being tuned.
+  Expect it to stall or flounder once a fight starts.
+- **Tutorial-area tuned.** Navigation, exits, the intro, and the starter pick
+  are tuned and tested for the opening sequence: Red's house → Pallet Town →
+  Oak's Lab → starter choice. Later towns, gym leaders, and most of the story
+  are mechanically supported (badges objective, known-exits travel) but far
+  less battle-tested.
 - **ROM-specific addresses.** All RAM offsets come from the USA `pokered`
   decompilation. A different region/version (e.g. Blue, or a European ROM) will
   read garbage at these addresses. The expected ROM SHA-1 is pinned in Setup.
@@ -229,8 +247,8 @@ TYPESAFE_LOG_LEVEL=info uv run jev-plays-pokemon --max-turns 20
 - `play.py:execute_goal` / `navigation.py:astar` — goal execution + pathfinding.
 - `agent.py:pick_action` — menu/battle micro-decision thresholds.
 - `agent.py:_sample_goal` / `TYPESAFE_TEMPERATURE`, `TYPESAFE_GOAL_FLOOR` — how much the model's goal distribution is flattened before sampling.
-- `state.py:INSTRUCTIONS` — the prompt Jev reads every turn (strategy, battle chart, action semantics).
-- `state.py:_decide_objective` — the high-level goal (first Pokémon, earn badges, become Champion), derived from RAM facts — no story script.
+- `state.py:INSTRUCTIONS` — the prompt Jev reads every turn (strategy, battle chart, action semantics, long-term goal).
+- `state.py:StateBuilder` — the in-code memory: `recent_hints`, `recent_actions`, explored-fraction per room. No hardcoded per-turn objective; Jev infers the next step from dialog, actions, and exploration progress.
 - `agent.py:ACTION_FRAMES` — press-hold and settle frame counts per button.
 
 ## Credits

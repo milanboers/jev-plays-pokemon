@@ -2,7 +2,7 @@
 
 Combines RAM-derived structured state (via the vendored Red/Blue reader),
 the ground-truth walkability map, the decoded on-screen text, and in-code
-memory (objective, recent actions) into one JSON-serialisable dict.
+memory (recent hints, recent actions) into one JSON-serialisable dict.
 """
 
 from __future__ import annotations
@@ -27,25 +27,27 @@ from jev_plays_pokemon.vendor.state.builder import build_game_state
 # for the tutorial rooms that is Pallet Town (map 0).
 
 INSTRUCTIONS = """\
-You are RED in Pokemon Red on a Game Boy. Control the game one button press at a time. \
-Pick the ONE action that best advances the objective.
+You are RED in Pokemon Red on a Game Boy. Your long-term goal: earn all 8 gym badges \
+and become the Champion. NPC dialog tells you where to go and what to do next - follow it. \
+Control the game one button press at a time. Pick the ONE action that best advances your goal.
 
 State:
 - screen_text: dialog/menu text on screen.
-- recent_hints: what people have recently told you (kept across turns even after the text box closes). Use these to decide where to go or what to do next.
+- recent_hints: what people have recently told you (kept across turns even after the text box closes). Ordered OLDEST first, NEWEST LAST - the rightmost entry is what was just said. Use these to decide where to go or what to do next.
+- recent_actions: the last high-level actions you took, ordered OLDEST first, NEWEST LAST - the final entry is what you just did. Don't repeat the most recent action unless it is clearly right.
 - collision_map: walkable grid around you (@=you at E5, .=walkable, #=blocked).
-- walkable_directions: which of up/down/left/right you can step to right now; authoritative, already includes walls you bumped.
-- room_map: explored part of the room (@=you, .=walkable, #=blocked, space=unexplored).
+- walkable_directions: which of up/down/left/right you can step to right now; authoritative, live from the game's collision data each frame.
+- room_map: explored part of the room (@=you, .=walkable, #=blocked, space=unexplored). explored_fraction shows how much of the room you have seen (0-1). When it stops growing, you have seen everything reachable - stop exploring and pick a goal that moves you forward (talk or leave).
 - objects: people/objects on the current map with their screen cell (A1..J9, you are E5) and direction/distance from you. Walk next to someone and press A to talk; talk to NPCs to progress the story.
 - unexplored_hint: first step toward the nearest unexplored area.
 - probe_exits=true: the room is fully explored.
-- goals: the things you could do right now, listed by id. Pick the ONE goal that best advances the objective; code will then walk you there.
+- goals: the things you could do right now, listed by id. Pick the ONE goal that best advances your goal; code will then walk you there.
 - known_exits: exits of this room you know about, with their tile coords and direction from you (doors/stairs look like solid walls # - step onto them to exit).
 
 Priority: (1) dialog/text box open -> advance_text, unless it is a menu or question. \
 (2) in battle -> handle the battle. \
 (3) party hurt -> reach a Pokemon Center. \
-(4) follow the objective: talk to the NPCs listed under goals, or pick reach_exit to leave the room. \
+(4) follow the story: talk to the NPCs listed under goals, or pick reach_exit to leave the room. \
 (5) when idle, explore toward unexplored space; if stuck, press B then try another way.
 
 Your goal probabilities are sampled, so every option has a real chance. Do not rely on one favorite - give meaningful probability to the genuinely good alternatives. \
@@ -55,9 +57,9 @@ NPC dialog is your guide: people tell you where to go and what to do next. Read 
 remember the direction or task it mentions (e.g. \"Go see Prof. Oak\", \"Deliver this\") and act on it. \
 Progress in this game is shown by gym badges - find each town's Gym Leader by following the directions NPCs give.
 
-Known exits (doors/stairs) are always offered in known_exits and goals - use them to move between rooms and towns when the objective calls for it. \
+Known exits (doors/stairs) are always offered in known_exits and goals - use them to move between rooms and towns when the story calls for it. \
 Do not oscillate (going UP then DOWN then UP). Stick to a multi-step direction toward your goal until you hit an obstacle or complete it. \
-Front doors and stairs look like solid walls (#) on the collision map. If your objective is to exit the room, walk INTO the wall that is the exit - the game transitions when you step onto a door/stairs tile.
+Front doors and stairs look like solid walls (#) on the collision map. To exit the room, walk INTO the wall that is the exit - the game transitions when you step onto a door/stairs tile.
 
 Buttons: press_a=confirm/interact/advance text/select highlighted; press_b=cancel/back/run; press_start=main menu; \
 walk_*=one D-pad press (moves you in the overworld, moves the cursor in menus); wait=do nothing ~half a second for animations.
@@ -70,56 +72,23 @@ Progress is shown by gym badges (8 total). NPCs give directions to the next town
 Use the collision map and known_exits to travel between towns."""
 
 
-def _walkable_directions(
-    collision: dict[str, Any],
-    walls: set[tuple[int, int, int, str]],
-    map_id: int | None,
-    x: int | None,
-    y: int | None,
-) -> dict[str, bool]:
+def _walkable_directions(collision: dict[str, Any]) -> dict[str, bool]:
     """Walkability of the four cells adjacent to the player (always cell E5).
 
     The collision grid is 9x10 (rows x cols) with the player locked to
-    row 4, col 4. Directions the player has physically bumped into at the
-    current (map, x, y) are reported as blocked too.
+    row 4, col 4. Purely from the live RAM collision data: a bump/sprite/NPC
+    is transient, so it is never remembered as a permanent wall.
     """
     walkable = collision.get("walkable")
     if not walkable:
-        base = {"up": True, "down": True, "left": True, "right": True}
-    else:
-        r, c = 4, 4
-        base = {
-            "up": bool(walkable[r - 1][c]),
-            "down": bool(walkable[r + 1][c]),
-            "left": bool(walkable[r][c - 1]),
-            "right": bool(walkable[r][c + 1]),
-        }
-    if map_id is not None and x is not None and y is not None:
-        for d in ("up", "down", "left", "right"):
-            if (map_id, x, y, d) in walls:
-                base[d] = False
-    return base
-
-
-def _decide_objective(state: dict[str, Any]) -> str:
-    """A high-level goal, derived only from observable RAM facts.
-
-    Deliberately does NOT spell out the story (no town/quest names): the
-    immediate next step comes from NPC dialog, which the agent reads every
-    turn and is told to follow.
-    """
-    party = state.get("party") or []
-    flags = state.get("flags") or {}
-    badges = flags.get("badge_count") or 0
-
-    if not party:
-        return "Get your first Pokémon - talk to the people around you to find out how."
-    if badges < 8:
-        return (
-            f"Earn all the gym badges ({badges}/8): find each town's Gym Leader and defeat them. "
-            "NPCs give directions - follow their dialog."
-        )
-    return "Beat the Elite Four and become the Pokémon Champion."
+        return {"up": True, "down": True, "left": True, "right": True}
+    r, c = 4, 4
+    return {
+        "up": bool(walkable[r - 1][c]),
+        "down": bool(walkable[r + 1][c]),
+        "left": bool(walkable[r][c - 1]),
+        "right": bool(walkable[r][c + 1]),
+    }
 
 
 def compute_goals(
@@ -162,15 +131,8 @@ def compute_goals(
             }
         ]
 
-    # NPCs already talked to this map visit are not offered again (they would
-    # just repeat themselves); leaving and re-entering the map resets this,
-    # which is when their next dialogue unlocks. This structural removal is
-    # what actually breaks the loop - flattening the sampling can only shuffle
-    # probability between the goals that ARE offered.
     map_id = (state.get("map") or {}).get("map_id")
     for i, obj in enumerate(objects):
-        if (map_id, obj.get("picture")) in builder.talked_this_visit:
-            continue  # already heard what they have to say this visit
         if builder.talk_cooldown.get((map_id, obj.get("picture")), 0) > turn:
             continue
         if not (obj.get("on_screen") and obj.get("map")):
@@ -184,13 +146,16 @@ def compute_goals(
         )
 
     map_id = (state.get("map") or {}).get("map_id")
-    # Stateless: exits come from the live RAM warp table each frame, then the
-    # in-RAM history filter (recently visited maps) is applied on top.
+    # Exits come from the live RAM warp table each frame. All exits are always
+    # offered - never filtered by recency. Re-entering a room you just left is
+    # sometimes the right move (the story or a scripted event may demand it), so
+    # that's the MODEL's call; we only annotate which exits are recent via the
+    # goal description. Suppression based on map_history would risk removing the
+    # only exit and permanently stranding the agent.
     warps = builder.live_exits() if map_id is not None else None
     # When there are no known warps, the boundary-probe exit is only offered
     # once the room is fully explored - a fallback for "nothing left to
     # explore", so the model doesn't probe walls forever instead of exploring.
-    indoor = (state.get("tileset") or 0) != 0
     if not dialog_active:
         if warps:
             # Drop bogus self-loop exits (map -> itself) and the warp tile the
@@ -198,11 +163,6 @@ def compute_goals(
             filtered = [w for w in warps if w[2] != map_id]
             player_pos = (state.get("player") or {}).get("position") or {}
             filtered = [w for w in filtered if (w[0], w[1]) != (player_pos.get("x"), player_pos.get("y"))]
-            # In the overworld, don't offer re-entering a building we just
-            # left (that caused Pallet<->house bouncing); the model should
-            # head somewhere new instead.
-            if not indoor:
-                filtered = [w for w in filtered if w[2] not in builder.map_history]
             ordered = sorted(filtered, key=lambda w: w[2] in builder.map_history)
             for wx, wy, dest, direction in ordered:
                 dest_name = MAP_NAMES.get(dest, f"map {dest}")
@@ -233,7 +193,12 @@ def compute_goals(
     if not fully_explored and offered("explore") and all(g["id"] == "wait" for g in goals):
         goals.append({"id": "explore", "desc": "Explore the room toward unexplored space"})
 
-    goals.append({"id": "wait", "desc": "Wait a moment (let animations/transitions finish)"})
+    # wait is a do-nothing: only offer it when there is genuinely nothing else
+    # to pick, so the model can't retreat into it repeatedly. The cooldown set
+    # in the main loop keeps it out of the list after each use, forcing the
+    # model to vary.
+    if not goals:
+        goals.append({"id": "wait", "desc": "Wait a moment (let animations/transitions finish)"})
     return goals
 
 
@@ -247,7 +212,7 @@ class GameMemory:
     """Small in-code memory: recent actions and a short-term goal."""
 
     def __init__(self) -> None:
-        self.recent: deque[tuple[str, str]] = deque(maxlen=6)
+        self.recent: deque[tuple[str, str]] = deque(maxlen=12)
 
     def record(self, action: str, outcome: str) -> None:
         self.recent.append((action, outcome))
@@ -275,8 +240,7 @@ class RoomMap:
         return self.cells.setdefault(map_id, {})
 
     def update(self, map_id: int, x: int, y: int, walkable: dict[str, bool]) -> None:
-        """Record the current cell and its neighbours given the merged
-        ``walkable`` (collision data already corrected by learned walls)."""
+        """Record the current cell and its neighbours from the live collision data."""
         room = self._room(map_id)
         room[(x, y)] = self.WALKABLE
         for direction, ok in walkable.items():
@@ -381,16 +345,27 @@ class RoomMap:
 
     def is_fully_explored(self, map_id: int) -> bool:
         """True when every known walkable cell borders only known cells."""
+        return self.explored_fraction(map_id) >= 1.0
+
+    def explored_fraction(self, map_id: int) -> float:
+        """Fraction of walkable cells whose 4 neighbours are all known (0..1).
+
+        Reaches 1.0 exactly when :func:`is_fully_explored` is True, but is a
+        gradient before that - so the model sees progress ("lab 88% explored")
+        and can spot when exploration has plateaued, instead of a binary
+        "done / not done" that may never flip (unreachable cells keep a room
+        from ever reaching 100%).
+        """
         room = self._room(map_id)
-        if not room:
-            return False
-        for (x, y), kind in room.items():
-            if kind != self.WALKABLE:
-                continue
-            for d in ("up", "down", "left", "right"):
-                if self._adjacent(x, y, d) not in room:
-                    return False
-        return True
+        walkable = [cell for cell, kind in room.items() if kind == self.WALKABLE]
+        if not walkable:
+            return 0.0
+        closed = sum(
+            1
+            for (x, y) in walkable
+            if all(self._adjacent(x, y, d) in room for d in ("up", "down", "left", "right"))
+        )
+        return closed / len(walkable)
 
     def hint_toward_boundary(self, map_id: int, x: int, y: int) -> str | None:
         """First step toward the nearest walkable cell that touches a wall.
@@ -494,6 +469,11 @@ def capture_hint(
         label = f"{speaker or 'an NPC'}: {text}"
         if hints and hints[-1].endswith(label):
             return
+        # Deduplicate across the whole window: talking to the same NPC twice
+        # often repeats the same line, which would otherwise crowd out distinct
+        # information from the (small) hint window. Only skip exact repeats.
+        if label in hints:
+            return
         hints.append(label[:220])
 
 
@@ -502,8 +482,6 @@ class StateBuilder:
         self.reader = RedBlueMemoryReader(emu)
         self.memory = GameMemory()
         self.room_map = RoomMap()
-        # (map_id, x, y, direction) tuples the player has physically bumped.
-        self.walls: set[tuple[int, int, int, str]] = set()
         # Exits are NOT seeded: the authoritative list is read live from RAM
         # (wWarpEntries) every snapshot via live_exits(). This dict only
         # accumulates *confirmed* exits we physically walked through, as a
@@ -515,10 +493,8 @@ class StateBuilder:
         self._last_dir: str = "?"
         self._pending_warp: tuple[int, tuple[int, int], int, str] | None = None
         # Snapshots after a map change during which position/collision reads
-        # are unstable - do not trust walls or the map.
+        # are unstable - do not trust the map.
         self._transition_grace = 0
-        # (map_id, x, y, direction) -> consecutive failed steps (wall probe).
-        self._bump_counts: dict[tuple[int, int, int, str], int] = {}
         # Parsed nearby objects / goals from the last snapshot.
         self.objects: list[dict[str, Any]] = []
         self.goals: list[dict[str, str]] = []
@@ -526,13 +502,6 @@ class StateBuilder:
         # Keyed by map+sprite (not the reordering-prone slot index). Short and
         # EXPIRING: it is only a mild "you just did this" nudge.
         self.talk_cooldown: dict[tuple[int | None, int | None], int] = {}
-        # NPCs already talked to during the CURRENT map visit. Talking to an NPC
-        # more than once in a visit almost never helps (they repeat themselves),
-        # so they are NOT offered again until the map is left and re-entered -
-        # which is when multi-stage dialogue advances anyway. The flattened
-        # goal sampling alone cannot fix this: a stale "talk to Mom" goal keeps
-        # eating ~half the probability every turn because Mom is always there.
-        self.talked_this_visit: set[tuple[int | None, int | None]] = set()
         # goal id -> turn until which we stop offering that goal again, so a
         # recently-run futile action (explore that got stuck, a failed exit)
         # is not retried instantly. Short and expiring.
@@ -544,7 +513,7 @@ class StateBuilder:
         # Recently visited positions, used to avoid pacing loops when walking.
         self.move_history: deque[tuple[int, int]] = deque(maxlen=6)
         # What NPCs have told us (persistent across turns, unlike screen_text).
-        # Merged per conversation; we keep the last 8.
+        # Merged per conversation; we keep the last 14.
         self.hints: deque[str] = deque(maxlen=8)
         self._dialog_was_active = False
         self.last_talked: str | None = None  # NPC we just talked to (hint speaker)
@@ -600,9 +569,6 @@ class StateBuilder:
                 if (old_pos[0], old_pos[1], new_map, direction) not in warps:
                     warps.append((old_pos[0], old_pos[1], new_map, direction))
                 self.map_history.append(old_map)
-                # New map visit: talked-to NPCs may be re-offered (leaving and
-                # re-entering is what advances their multi-stage dialogue).
-                self.talked_this_visit = set()
             self._pending_warp = None
         self._last_map = map_id
         self._last_pos = (pos.get("x"), pos.get("y"))
@@ -666,34 +632,20 @@ class StateBuilder:
             return False
 
     def record_move(self, action: str, moved: bool) -> None:
-        """Learn walls: a walk action that repeatedly fails to move is a wall.
+        """Track the last walked direction (used to avoid pacing reversals).
 
-        A single failed step is often a dialog/menu input-lock or a frame
-        glitch, so a wall is only learned after two consecutive failures at
-        the same spot - otherwise we poison the room map and box ourselves in.
+        Deliberately does NOT learn walls from bumps: a failed step is often a
+        sprite/NPC/cutscene block or a frame glitch, and remembering it as a
+        hard "blocked" direction makes movement impossible based on a transient
+        state (the same anti-pattern as the removed talked_this_visit). The live
+        RAM collision grid is authoritative every frame instead.
         """
         if action not in ("walk_up", "walk_down", "walk_left", "walk_right"):
             return
-        direction = action.removeprefix("walk_")
-        pos = (self.reader.read_player() or {}).get("position") or {}
-        map_id = (self.reader.read_map_info() or {}).get("map_id")
-        if map_id is None or "x" not in pos or "y" not in pos:
-            return
-        key = (map_id, pos["x"], pos["y"], direction)
         if moved:
-            self._bump_counts.pop(key, None)
-            self._last_dir = direction
-            return
-        if self.dialog_active:
-            return  # input is locked by a text box; not a wall
-        if self._transition_grace > 0:
-            return  # position read is unstable right after a map change
-        self._bump_counts[key] = self._bump_counts.get(key, 0) + 1
-        if self._bump_counts[key] >= 2:
-            self.walls.add(key)
-            self._bump_counts.pop(key, None)
+            self._last_dir = action.removeprefix("walk_")
 
-    def snapshot(self, turn: int, objective_override: str | None = None) -> dict[str, Any]:
+    def snapshot(self, turn: int) -> dict[str, Any]:
         state = build_game_state(self.reader, frame_count=getattr(self.reader.emu, "frame_count", None))
 
         # On-screen text + collision map (needs the raw PyBoy handle).
@@ -710,27 +662,13 @@ class StateBuilder:
         collision = build_collision_grid(self.reader.emu)
         ascii_map = render_ascii_map(collision)
 
-        objective = objective_override or _decide_objective(state)
-
         pos = (state.get("player") or {}).get("position") or {}
         map_id = (state.get("map") or {}).get("map_id")
 
-        # A text box / script lock just completed. Cutscenes write temporary
-        # invisible collision blocks that vanish when the dialogue ends, so
-        # wipe learned walls to avoid getting trapped by stale cutscene memory.
-        if self._dialog_was_active and not dialog_active and map_id is not None:
-            self.walls = {w for w in self.walls if w[0] != map_id}
-            self._bump_counts.clear()
+        walkable = _walkable_directions(collision)
 
-        walkable = _walkable_directions(collision, self.walls, map_id, pos.get("x"), pos.get("y"))
-
-        # The room map must only mark a tile "blocked" when we physically
-        # bumped into it. The collision data's "blocked" is unreliable (doors,
-        # stairs and map edges look like walls), so it must not poison the map.
         if map_id is not None and "x" in pos and "y" in pos:
-            room_walkable = {
-                d: (map_id, pos["x"], pos["y"], d) not in self.walls for d in ("up", "down", "left", "right")
-            }
+            room_walkable = walkable
             self.room_map.update(map_id, pos["x"], pos["y"], room_walkable)
         room_map_text = (
             self.room_map.render(map_id, (pos["x"], pos["y"])) if map_id is not None else "(unknown map)"
@@ -741,6 +679,7 @@ class StateBuilder:
             else None
         )
         fully_explored = self.room_map.is_fully_explored(map_id) if map_id is not None else False
+        explored_fraction = self.room_map.explored_fraction(map_id) if map_id is not None else 0.0
         if fully_explored:
             boundary_hint = (
                 self.room_map.hint_toward_boundary(map_id, pos["x"], pos["y"])
@@ -795,7 +734,6 @@ class StateBuilder:
 
         return {
             "instructions": INSTRUCTIONS,
-            "objective": objective,
             "screen_text": "\n".join(screen_lines) if screen_lines else "(no text on screen)",
             "recent_hints": " | ".join(self.hints) if self.hints else "(none yet)",
             "collision_map": ascii_map,
@@ -806,6 +744,7 @@ class StateBuilder:
             "goals": goals_text,
             "known_exits": known_exits,
             "unexplored_hint": unexplored_hint,
+            "explored_fraction": explored_fraction,
             "probe_exits": fully_explored,
             "location": {
                 "map": (state.get("map") or {}).get("map_name"),
@@ -855,8 +794,6 @@ def render_state_line(state: dict[str, Any]) -> str:
     text = state.get("screen_text", "")
     text = " ".join(text.split())
     text = text[:44] + ("…" if len(text) > 44 else "")
-    objective = state.get("objective", "")
-    objective = objective[:64] + ("…" if len(objective) > 64 else "")
     objects = state.get("objects", "")
     objects = objects.replace("\n", " | ")
     objects = objects[:60] + ("…" if len(objects) > 60 else "")
@@ -865,13 +802,20 @@ def render_state_line(state: dict[str, Any]) -> str:
         exits = exits[:70] + ("…" if len(exits) > 70 else "")
     tail = f" | {objects}" if objects else ""
     tail += f" | {exits}" if exits else ""
+    frac = state.get("explored_fraction")
+    if frac is not None:
+        tail += f" | explored {frac * 100:.0f}%"
     hints = state.get("recent_hints", "")
     if hints and hints != "(none yet)":
         latest = hints.split(" | ")[-1][:44]
         tail += f" | hint:{latest}"
+    goals = state.get("goals", "")
+    if goals:
+        ids = ", ".join(g.split(":")[0] for g in goals.split(" | ") if ":" in g)
+        tail += f" | goals:[{ids}]"
     return (
         f"turn {state['turn']} | {loc['map']} ({loc['x']},{loc['y']}) facing {loc['facing']} | "
-        f"open:{open_dirs or '-'} | {objective}{tail} | text:{text!r}"
+        f"open:{open_dirs or '-'} | {tail} | text:{text!r}"
     )
 
 
@@ -883,18 +827,17 @@ def render_text_state(state: dict[str, Any]) -> str:
         f"({state['location']['x']},{state['location']['y']}) facing {state['location']['facing']}  "
         f"${state['player'].get('money')}  badges={len(state['player'].get('badges') or [])}"
     )
-    lines.append(f"objective: {state['objective']}")
     open_dirs = [d for d, ok in (state.get("walkable_directions") or {}).items() if ok]
-    blocked_learned = [d for d, ok in (state.get("walkable_directions") or {}).items() if not ok]
-    lines.append(
-        f"  open: {', '.join(open_dirs) if open_dirs else 'none'}"
-        f"  (learned blocked: {', '.join(blocked_learned) if blocked_learned else 'none'})"
-    )
+    lines.append(f"  open: {', '.join(open_dirs) if open_dirs else 'none'}")
     hint = state.get("unexplored_hint")
     if hint:
         lines.append(f"  unexplored hint: {hint}")
     if state.get("probe_exits"):
         lines.append("  (room fully explored - probe the walls for the exit)")
+    goals = state.get("goals")
+    if goals:
+        for g in goals.split(" | "):
+            lines.append(f"  goal: {g}")
     room_map = state.get("room_map")
     if room_map and room_map != "(nothing explored yet)":
         for rm_line in room_map.splitlines():

@@ -64,7 +64,6 @@ class TestStateSnapshot:
         state = builder.snapshot(1)
         for key in (
             "instructions",
-            "objective",
             "screen_text",
             "recent_hints",
             "collision_map",
@@ -79,6 +78,7 @@ class TestStateSnapshot:
             "flags",
             "turn",
             "recent_actions",
+            "explored_fraction",
             "dialog_active",
         ):
             assert key in state, f"missing key {key}"

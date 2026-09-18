@@ -44,7 +44,7 @@ def player_map(builder) -> tuple[int, int]:
 
 
 def _walk_step(emu, builder, direction: str) -> bool:
-    """Press a direction; learn walls; return True if the player moved."""
+    """Press a direction; return True if the player moved."""
     if builder.dialog_active:
         return False  # a text box locks all movement input
     before = player_map(builder)
@@ -144,10 +144,11 @@ def _astar_to(emu, builder, state, target: tuple[int, int]) -> list[str] | None:
 def _optimistic_walkable(builder, state: dict[str, Any]):
     """Walkable callback for routing.
 
-    Collision "blocked" is NOT trusted: the game's collision data marks
+    Collision "blocked" is NOT fully trusted: the game's collision data marks
     doors, stairs, map edges and (at some screen positions) entire walkable
-    blocks as walls. Only tiles we have physically bumped into are treated as
-    blocked, so the walker is never paralyzed by bad collision readings.
+    blocks as walls. Warp/exit tiles are always passable (you step onto them to
+    exit); everything else is optimistic-passable so the walker is never
+    paralyzed by a single bad collision reading.
     """
     map_id = state["location"]["map_id"]
     cells = builder.room_map.cells.get(map_id, {}) if map_id is not None else {}
@@ -160,21 +161,25 @@ def _optimistic_walkable(builder, state: dict[str, Any]):
         if (mx, my) in warp_tiles:
             return True
         if cells.get((mx, my)) == "blocked":
-            return False  # a wall we have physically bumped into
+            return False  # the live collision data reports it blocked
         return True  # optimistic: assume passable until proven otherwise
 
     return walkable
 
 
 def _force_wiggle(emu, builder) -> bool:
-    """Force-try all four directions, ignoring the (possibly poisoned) map.
+    """Force-try all four directions in a random order.
 
-    The game itself is the ground truth for walkability: a falsely-learned
-    wall will yield, a real one will bump (and get re-learned correctly).
+    The game itself is the ground truth for walkability: a transient block
+    (NPC/sprite) will yield when it moves; a real wall just bumps. Shuffling
+    the order means a repeated stuck sequence does not keep bumping the same
+    wall first every time - there is always a (stochastic) way out.
     Returns True if the player moved at all.
     """
+    import random
+
     player_map(builder)
-    for direction in ("up", "down", "left", "right"):
+    for direction in random.sample(("up", "down", "left", "right"), 4):
         if _walk_step(emu, builder, direction):
             return True
     return False
@@ -248,6 +253,19 @@ def execute_goal(emu, builder, goal_id: str, state: dict[str, Any], max_steps: i
     return "no-op"
 
 
+def _is_nickname_prompt(text: str, hints) -> bool:
+    """Is the open box the "give a nickname?" YES/NO prompt?
+
+    The model cannot reliably tell this two-option menu from a plain dialog,
+    and mashing A would confirm YES and open the name-entry keyboard. Detect
+    it by text and decline with B (keeps the default species name).
+    """
+    lowered = text.lower()
+    if "nickname" in lowered or "give a nickname" in lowered:
+        return True
+    return any("nickname" in h.lower() for h in hints)
+
+
 def _advance_text(emu, builder, max_steps: int) -> str:
     from jev_plays_pokemon.screen_text import read_screen_text
     from jev_plays_pokemon.stop import stop_requested
@@ -258,6 +276,14 @@ def _advance_text(emu, builder, max_steps: int) -> str:
         if not builder.dialog_active:
             return "dialog cleared"
         pb = emu._pyboy
+        # A "give a nickname?" YES/NO prompt must be declined deterministically
+        # (press B = keep the default species name). The model cannot reliably
+        # tell this two-option menu from a plain dialog, and mashing A would
+        # confirm YES and open the name-entry keyboard, stranding the agent.
+        text_now = " ".join(line.strip() for line in read_screen_text(pb) if line.strip())
+        if _is_nickname_prompt(text_now, builder.hints):
+            press(emu, "press_b")
+            return "nickname prompt declined"
         # Pause inputs and sample until the box is fully typed. Mashing A every
         # frame races the render, so the box never settles and text decodes
         # garbled. Wait for the ▼ arrow: the engine only draws it (0xEE) in
@@ -297,6 +323,39 @@ def _move_toward(emu, builder, target: tuple[int, int], forbidden=None) -> bool:
     path = screen_grid.astar_screen(target, walkable, sprites, allow_wall_goal=True, forbidden=forbidden)
     if path and _walk_step(emu, builder, path[0]):
         return True
+    return _force_wiggle(emu, builder)
+
+
+def _move_adjacent_to(emu, builder, target: tuple[int, int]) -> bool:
+    """Screen-relative step toward a cell ADJACENT to ``target``.
+
+    Used when the target sits on a BLOCKED tile (Poke Ball on the table, an
+    NPC behind a counter): you can never step onto that tile, so A* *to* it is
+    wrong - when adjacent it returns the impossible straight step onto the
+    wall. Route to the nearest REACHABLE walkable neighbour instead; the talk
+    loop's adjacency check then faces the target and presses A.
+    ``target`` is a screen cell (row, col); the player is always at (4,4).
+    """
+    from jev_plays_pokemon import screen_grid
+
+    pb = builder.reader.emu._pyboy
+    walkable = screen_grid.walkable_grid(pb)
+    sprites = screen_grid.sprite_cells(pb)
+    tr, tc = target
+    neighbours: list[tuple[int, int]] = []
+    for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        nr, nc = tr + dr, tc + dc
+        if not (0 <= nr < 9 and 0 <= nc < 10):
+            continue
+        if (nr, nc) == screen_grid.PLAYER:
+            return True  # already adjacent
+        if walkable[nr, nc] and (nr, nc) not in sprites:
+            neighbours.append((nr, nc))
+    neighbours.sort(key=lambda c: abs(c[0] - 4) + abs(c[1] - 4))
+    for cell in neighbours:
+        path = screen_grid.astar_screen(cell, walkable, sprites, allow_wall_goal=True)
+        if path and _walk_step(emu, builder, path[0]):
+            return True
     return _force_wiggle(emu, builder)
 
 
@@ -379,13 +438,20 @@ def _talk_to(emu, builder, state, index: int, max_steps: int) -> str:
                     press(emu, f"walk_{direction}")
                     break
             press(emu, "press_a")
-            map_id = state.get("location", {}).get("map_id")
-            key = (map_id, obj.get("picture"))
-            builder.talked_this_visit.add(key)  # don't re-offer this visit
             builder.last_talked = obj.get("name") or f"NPC {index}"
             result = "talked (A pressed)"
             break
-        if _move_toward(emu, builder, target):
+        # Walk toward the target. A target on a WALKABLE tile (a normal NPC) is
+        # reached with plain A* - pathing onto its tile is fine because we
+        # stop at the adjacent cell and the top-of-loop adjacency check faces
+        # and talks. A target on a BLOCKED tile (Poke Ball on the table, an
+        # NPC behind a counter) can never be stepped onto, so route to the
+        # nearest walkable neighbour instead.
+        pb = builder.reader.emu._pyboy
+        target_blocked = not bool(screen_grid.walkable_grid(pb)[target[0], target[1]])
+        if (target_blocked and _move_adjacent_to(emu, builder, target)) or (
+            not target_blocked and _move_toward(emu, builder, target)
+        ):
             continue
         if builder.dialog_active:
             result = "dialog opened while walking"
@@ -453,11 +519,30 @@ def _reach_exit(emu, builder, state, max_steps: int, dest: int | None) -> str:
             if _step_onto(emu, builder, door):
                 continue
 
-        # 3) Warp not on-screen: walk toward it in map space. This is the
-        #    "head toward the exit" step - no boundary tracing needed.
+        # 3) Warp not on-screen: pathfind toward it in map space. The naive
+        #    cardinal "steer" step alone can't cope when furniture or an NPC
+        #    blocks the direct line (e.g. Blue's House: door at (2,7)/(3,7) but
+        #    Daisy/Pokedex occupy (2,3)/(3,3)) - so route around with map-space
+        #    A* over the verified room map (warp tiles are passable), taking
+        #    the first step of that path. Fall back to cardinal steering when
+        #    no room-map path exists yet (unexplored floor).
         if steer:
             island_bailout = 0
-            if _walk_step(emu, builder, steer):
+            px, py = player_map(builder)
+            warps = builder.live_exits()
+            path = None
+            if warps:
+                warp = min(
+                    (w for w in warps if screen_grid._warp_matches(dest, w[2])),
+                    key=lambda w: abs(w[0] - px) + abs(w[1] - py),
+                    default=None,
+                )
+                if warp is not None:
+                    path = astar((px, py), (warp[0], warp[1]), _room_walkable(builder, state))
+            if path:
+                if _walk_step(emu, builder, path[0]):
+                    continue
+            elif _walk_step(emu, builder, steer):
                 continue
 
         # 4) Probe the wall beside us (might be the exit if warps are stale).

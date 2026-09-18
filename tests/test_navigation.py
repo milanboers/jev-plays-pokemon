@@ -61,6 +61,22 @@ class TestAStar:
         grid[:, :] = False
         assert screen_grid.astar_screen((4, 6), grid) is None
 
+    def test_blocked_goal_routes_around_via_neighbor(self):
+        # A Poke Ball sits on a blocked table tile. astar_screen with
+        # allow_wall_goal=True treats the goal as passable, so it returns a
+        # path that routes around to reach it - ending adjacent, where the
+        # talk routine faces the target and presses A. Verify the walkable
+        # neighbour cells of the blocked tile are reachable around it.
+        grid = GRID.copy()
+        grid[4, 5] = False  # the blocked table tile under the ball
+        # Neighbour cells of the blocked tile that are walkable + reachable.
+        for cell in ((3, 5), (5, 5), (4, 6)):
+            assert screen_grid.astar_screen(cell, grid) is not None, f"{cell} unreachable"
+        # Even with (4,6) also walled, the vertical neighbours still work.
+        grid[4, 6] = False
+        assert screen_grid.astar_screen((3, 5), grid) is not None
+        assert screen_grid.astar_screen((5, 5), grid) is not None
+
 
 class TestFrontier:
     def test_finds_cell_adjacent_to_wall(self):

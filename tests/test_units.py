@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from jev_plays_pokemon.agent import Decision, pick_action
+from jev_plays_pokemon.main import _goal_label
 from jev_plays_pokemon.navigation import astar, make_walkable
 from jev_plays_pokemon.objects import SPRITE_NAMES, _relative, read_objects, render_objects
 from jev_plays_pokemon.state import (
     RoomMap,
-    _decide_objective,
     _walkable_directions,
     capture_hint,
     compute_goals,
@@ -25,21 +25,15 @@ def make_decision(action: str, conf: float, margin: float, nouls: dict[str, floa
 class TestWalkableDirections:
     def test_base_from_collision(self):
         collision = {"walkable": [[True] * 10 for _ in range(9)]}
-        w = _walkable_directions(collision, set(), 38, 3, 6)
+        w = _walkable_directions(collision)
         assert w == {"up": True, "down": True, "left": True, "right": True}
 
-    def test_learned_wall_blocks(self):
+    def test_blocked_from_collision(self):
         collision = {"walkable": [[True] * 10 for _ in range(9)]}
-        walls = {(38, 3, 6, "down")}
-        w = _walkable_directions(collision, walls, 38, 3, 6)
+        collision["walkable"][5][4] = False  # below the player (row 4) is blocked
+        w = _walkable_directions(collision)
         assert w["down"] is False
         assert w["up"] is True
-
-    def test_wall_scoped_to_position(self):
-        collision = {"walkable": [[True] * 10 for _ in range(9)]}
-        walls = {(38, 3, 6, "down")}
-        w = _walkable_directions(collision, walls, 38, 4, 6)
-        assert w["down"] is True
 
 
 class TestRoomMap:
@@ -75,6 +69,28 @@ class TestRoomMap:
         rm.update(38, 3, 6, {"up": False, "down": False, "left": False, "right": False})
         # The neighbours are marked blocked; but the cell itself is walkable.
         assert rm.is_fully_explored(38) is True
+
+    def test_explored_fraction_is_gradient(self):
+        rm = RoomMap()
+        room = rm.cells.setdefault(38, {})
+        # Two sealed 1x1 cells: (3,6) closed, (4,6) missing its right neighbour.
+        for cell in ((3, 6), (4, 6)):
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                room[(cell[0] + dx, cell[1] + dy)] = RoomMap.BLOCKED
+        room.pop((5, 6))  # the right neighbour of (4,6) is actually unexplored
+        for cell in ((3, 6), (4, 6)):
+            room[cell] = RoomMap.WALKABLE
+        frac = rm.explored_fraction(38)
+        assert frac == 0.5
+        assert rm.is_fully_explored(38) is False
+        # Sealing the final unknown neighbour reaches 100% exactly.
+        room[(5, 6)] = RoomMap.BLOCKED
+        assert rm.explored_fraction(38) == 1.0
+        assert rm.is_fully_explored(38) is True
+
+    def test_explored_fraction_empty_room_is_zero(self):
+        rm = RoomMap()
+        assert rm.explored_fraction(99) == 0.0
 
     def test_boundary_hint_points_to_wall(self):
         rm = RoomMap()
@@ -208,7 +224,6 @@ class TestGoals:
             def __init__(self):
                 self.known_warps = warps or {}
                 self.talk_cooldown = {}
-                self.talked_this_visit = set()
                 self.goal_cooldown = {}
                 self.map_history = []
 
@@ -260,9 +275,12 @@ class TestGoals:
         goals = compute_goals(b, dialog_active=False, objects=objs, fully_explored=False, state=state, turn=6)
         assert any(g["id"] == "talk_to_0" for g in goals)
 
-    def test_talk_suppressed_for_whole_visit(self):
+    def test_talk_still_offered_after_talked(self):
+        # Regression: talking to an NPC once must NOT remove the talk goal for
+        # the whole visit - a stray A-press (e.g. landing on a different open
+        # dialog box) would otherwise permanently hide an important NPC like
+        # Oak. Whether to re-talk is up to the agent, not structural removal.
         b = self._builder()
-        b.talked_this_visit = {(37, 0x33)}  # Mom already talked to this visit
         state = {"map": {"map_id": 37}}
         objs = [
             {
@@ -275,11 +293,11 @@ class TestGoals:
             }
         ]
         goals = compute_goals(b, dialog_active=False, objects=objs, fully_explored=False, state=state, turn=3)
-        assert all(g["id"] != "talk_to_0" for g in goals)
+        assert any(g["id"] == "talk_to_0" for g in goals)
 
     def test_exit_goal_needs_known_warp_or_full_exploration(self):
         b = self._builder()
-        state = {"map": {"map_id": 40}, "tileset": 1}
+        state = {"map": {"map_id": 40}}
         goals = compute_goals(b, dialog_active=False, objects=[], fully_explored=False, state=state, turn=0)
         assert all(g["id"] != "reach_exit" for g in goals)
         # Once fully explored, the exit goal appears.
@@ -288,14 +306,59 @@ class TestGoals:
 
     def test_known_warp_triggers_exit_goal(self):
         b = self._builder({40: [(3, 8, 0, "down")]})
-        state = {"map": {"map_id": 40}, "party": [{"species": "X"}], "tileset": 1}
+        state = {"map": {"map_id": 40}, "party": [{"species": "X"}]}
         # A known warp is always offered, even before the room is explored.
         goals = compute_goals(b, dialog_active=False, objects=[], fully_explored=False, state=state, turn=0)
         assert any(g["id"] == "exit_to_0" for g in goals)
 
+    def test_exit_to_recently_left_map_kept(self):
+        # Exits to recently-left maps are always offered (never filtered);
+        # re-entering is the model's call, annotated via the goal description.
+        b = self._builder({40: [(4, 11, 0, "down")]})
+        b.map_history = [0]  # we just left Pallet
+        state = {"map": {"map_id": 40}, "party": [{"species": "X"}]}
+        goals = compute_goals(b, dialog_active=False, objects=[], fully_explored=False, state=state, turn=0)
+        assert any(g["id"] == "exit_to_0" for g in goals)
+        # The "recently left" note is included so the model has the context.
+        assert any("just left" in g["desc"] for g in goals if g["id"] == "exit_to_0")
+
+    def test_exit_never_all_filtered_in_overworld(self):
+        # All exits are always offered - the recently-left-maps history is only
+        # a description note, never a filter. So visiting all of Pallet's
+        # houses cannot remove the exits (which would strand the agent).
+        b = self._builder({0: [(5, 5, 37, "up"), (13, 5, 39, "up"), (12, 11, 40, "down")]})
+        b.map_history = [38, 37, 40, 39]  # visited all three houses recently
+        state = {
+            "map": {"map_id": 0},
+            "player": {"position": {"x": 7, "y": 7}},
+            "party": [{"species": "X"}],
+            "flags": {"badge_count": 0},
+        }
+        goals = compute_goals(b, dialog_active=False, objects=[], fully_explored=False, state=state, turn=0)
+        exits = [g["id"] for g in goals if g["id"].startswith("exit_to_")]
+        assert len(exits) == 3  # all three offered regardless of history
+
+    def test_exit_note_marks_recently_left(self):
+        # The description annotates which exits are recently-left, so the
+        # model can weigh them without the option being removed.
+        b = self._builder({0: [(5, 5, 37, "up"), (13, 5, 39, "up")]})
+        b.map_history = [37]
+        state = {
+            "map": {"map_id": 0},
+            "player": {"position": {"x": 7, "y": 7}},
+            "party": [{"species": "X"}],
+            "flags": {"badge_count": 0},
+        }
+        goals = compute_goals(b, dialog_active=False, objects=[], fully_explored=False, state=state, turn=0)
+        exit_ids = [g["id"] for g in goals if g["id"].startswith("exit_to_")]
+        assert set(exit_ids) == {"exit_to_37", "exit_to_39"}
+        by_id = {g["id"]: g["desc"] for g in goals}
+        assert "just left" in by_id["exit_to_37"]
+        assert "just left" not in by_id["exit_to_39"]
+
     def test_no_warp_probe_only_when_explored(self):
         b = self._builder()  # no warps
-        state = {"map": {"map_id": 40}, "party": [{"species": "X"}], "tileset": 1}
+        state = {"map": {"map_id": 40}, "party": [{"species": "X"}]}
         goals = compute_goals(b, dialog_active=False, objects=[], fully_explored=False, state=state, turn=0)
         assert all(g["id"] != "reach_exit" for g in goals)
         # Fully explored + no known warp: boundary-probe exit appears.
@@ -304,14 +367,14 @@ class TestGoals:
 
     def test_self_loop_warp_is_dropped(self):
         b = self._builder({40: [(3, 8, 40, "down")]})  # map 40 -> map 40 (bogus)
-        state = {"map": {"map_id": 40}, "party": [{"species": "X"}], "tileset": 1}
+        state = {"map": {"map_id": 40}, "party": [{"species": "X"}]}
         goals = compute_goals(b, dialog_active=False, objects=[], fully_explored=True, state=state, turn=0)
         assert all(not g["id"].startswith("exit_to_") for g in goals)
 
     def test_explore_suppressed_after_recent_run(self):
         b = self._builder()
         b.goal_cooldown["explore"] = 10
-        state = {"map": {"map_id": 40}, "tileset": 1}
+        state = {"map": {"map_id": 40}}
         goals = compute_goals(b, dialog_active=False, objects=[], fully_explored=False, state=state, turn=3)
         assert all(g["id"] != "explore" for g in goals)
         # Expired cooldown -> explore is offered again.
@@ -319,13 +382,23 @@ class TestGoals:
         assert any(g["id"] == "explore" for g in goals)
 
     def test_explore_fallback_when_only_wait(self):
-        # Even when nothing else is offered, explore remains as a fallback so
-        # the goal list is never just "wait" (no cooldown here).
+        # When explore is on the table, wait is NOT offered - the model must
+        # pick a real goal, not retreat into do-nothing.
         b = self._builder()
-        state = {"map": {"map_id": 40}, "tileset": 1}
+        state = {"map": {"map_id": 40}}
         goals = compute_goals(b, dialog_active=False, objects=[], fully_explored=False, state=state, turn=3)
         assert any(g["id"] == "explore" for g in goals)
-        assert any(g["id"] == "wait" for g in goals)
+        assert all(g["id"] != "wait" for g in goals)
+
+    def test_wait_offered_when_nothing_else(self):
+        # With nothing else available (explore cooled down, no warps, room not
+        # yet fully explored), wait is the only fallback so the list is never
+        # empty - but it is still suppressed once a real goal appears.
+        b = self._builder()
+        b.goal_cooldown["explore"] = 10
+        state = {"map": {"map_id": 40}}
+        goals = compute_goals(b, dialog_active=False, objects=[], fully_explored=False, state=state, turn=3)
+        assert [g["id"] for g in goals] == ["wait"]
 
 
 class TestObjects:
@@ -442,6 +515,28 @@ class TestHintMemory:
         assert len(hints) == 8
         assert list(hints) == [f"an NPC: Conversation number {i}." for i in range(1, 9)]
 
+    def test_dedup_exact_repeat_across_window(self):
+        # Talking to the same NPC twice repeats the same line; the exact
+        # repeat must not crowd out distinct information from the window.
+        hints = self._hints()
+        capture_hint(
+            hints,
+            dialog_active=True,
+            screen_lines=["The parcel is for Oak."],
+            continuous=False,
+            speaker="Mom",
+        )
+        capture_hint(hints, dialog_active=False, screen_lines=[], continuous=True)
+        capture_hint(
+            hints,
+            dialog_active=True,
+            screen_lines=["The parcel is for Oak."],
+            continuous=False,
+            speaker="Mom",
+        )
+        assert len(hints) == 1
+        assert list(hints) == ["Mom: The parcel is for Oak."]
+
     def test_skips_menus_and_short_text(self):
         hints = self._hints()
         capture_hint(hints, dialog_active=True, screen_lines=["▶ POKEMON", "ITEM"])
@@ -495,6 +590,19 @@ class TestMicroPath:
         )
         assert "press_a=0.70" in gd.summary()
 
+    def test_goal_decision_prob_line(self):
+        from jev_plays_pokemon.agent import GoalDecision
+
+        gd = GoalDecision(
+            goal="exit_to_0",
+            confidence=0.6,
+            nouls={},
+            menu_open=None,
+            probabilities={"exit_to_0": 0.6, "explore": 0.25, "wait": 0.15},
+        )
+        assert gd.prob_line() == "exit_to_0=0.60, explore=0.25, wait=0.15"
+        assert GoalDecision(goal="x", confidence=0.0, nouls={}, menu_open=None).prob_line() == ""
+
 
 class TestRenderStateLine:
     def test_single_line_compact(self):
@@ -502,7 +610,6 @@ class TestRenderStateLine:
             "turn": 7,
             "location": {"map": "Red's House 1F", "x": 3, "y": 6, "facing": "up"},
             "walkable_directions": {"up": False, "down": True, "left": True, "right": True},
-            "objective": "Get your starter Pokémon",
             "screen_text": "The wild RATTATA appeared!",
         }
         line = render_state_line(state)
@@ -515,41 +622,23 @@ class TestRenderStateLine:
             "turn": 1,
             "location": {"map": "X", "x": 0, "y": 0, "facing": "up"},
             "walkable_directions": {},
-            "objective": "a" * 200,
             "screen_text": "b" * 200,
         }
         line = render_state_line(state)
         assert len(line) < 220
 
 
-class TestObjective:
-    def test_no_party_wants_first_pokemon(self):
-        state = {"party": [], "flags": {}, "player": {}}
-        objective = _decide_objective(state)
-        assert "Pokémon" in objective
-        # High-level only: no scenario spelled out.
-        assert "Oak" not in objective and "lab" not in objective.lower()
-
-    def test_badges_objective_is_high_level(self):
-        state = {
-            "party": [{"species": "Charmander"}],
-            "flags": {"has_oaks_parcel": True, "has_pokedex": False, "badge_count": 2},
-            "player": {"badge_count": 2},
-        }
-        objective = _decide_objective(state)
-        # Even with parcel/pokedex flags set, the goal stays high-level.
-        assert "badges" in objective.lower()
-        assert "Parcel" not in objective and "Oak" not in objective
-        for banned in ("Brock", "Misty", "Surge", "Pewter", "Cerulean"):
-            assert banned not in objective
-
-    def test_all_badges_wants_champion(self):
-        state = {
-            "party": [{"species": "Charizard"}],
-            "flags": {"has_oaks_parcel": False, "has_pokedex": True, "badge_count": 8},
-            "player": {"badge_count": 8},
-        }
-        assert "Champion" in _decide_objective(state)
+class TestObjectiveRemoved:
+    def test_objective_not_in_state(self):
+        """The hardcoded per-turn objective is gone; the game-wide goal lives in INSTRUCTIONS."""
+        assert "objective" not in render_state_line(
+            {
+                "turn": 1,
+                "location": {"map": "X", "x": 0, "y": 0, "facing": "up"},
+                "walkable_directions": {},
+                "screen_text": "",
+            }
+        )
 
 
 class TestSampleGoal:
@@ -623,3 +712,45 @@ class TestSampleGoal:
             goal, _conf = _sample_goal(probs, temperature=1.0)
             counts[goal] += 1
         assert counts["b"] > counts["a"]  # b still preferred
+
+
+class TestGoalLabel:
+    def test_talk_uses_sprite_name(self):
+        class FakeBuilder:
+            objects = [{"name": "Mom"}, {"name": "Oak"}]
+
+        assert _goal_label("talk_to_0", FakeBuilder()) == "talked to Mom"
+        assert _goal_label("talk_to_1", FakeBuilder()) == "talked to Oak"
+
+    def test_talk_falls_back_when_object_missing(self):
+        class FakeBuilder:
+            objects = []
+
+        assert _goal_label("talk_to_0", FakeBuilder()) == "talked to someone"
+
+    def test_exit_uses_map_name(self):
+        assert _goal_label("exit_to_37", None) == "went to Red's House 1F"
+
+    def test_verb_labels(self):
+        assert _goal_label("explore", None) == "explored"
+        assert _goal_label("reach_exit", None) == "searched for the exit"
+        assert _goal_label("advance_text", None) == "advanced the dialog"
+        assert _goal_label("wait", None) == "waited"
+
+    def test_unknown_goal_passes_through(self):
+        assert _goal_label("battle", None) == "battle"
+
+
+class TestNicknamePrompt:
+    def test_detects_nickname_in_text(self):
+        from jev_plays_pokemon.play import _is_nickname_prompt
+
+        assert _is_nickname_prompt("Do you want to give a nickname to CHARMANDER?", [])
+        assert _is_nickname_prompt("Do you want to give a nickname to SQUIRTLE?", [])
+        assert _is_nickname_prompt("", ["an NPC: u want to a nickname"])
+
+    def test_not_triggered_by_normal_dialog(self):
+        from jev_plays_pokemon.play import _is_nickname_prompt
+
+        assert not _is_nickname_prompt("These are POKéMON!", [])
+        assert not _is_nickname_prompt("", [])

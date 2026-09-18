@@ -84,10 +84,18 @@ class GoalDecision:
     confidence: float
     nouls: dict[str, float]
     menu_open: float | None
+    probabilities: dict[str, float] | None = None
 
     def summary(self) -> str:
         ranked = sorted(self.nouls.items(), key=lambda kv: -kv[1])
         return ", ".join(f"{k}={v:.2f}" for k, v in ranked[:5])
+
+    def prob_line(self) -> str:
+        """The model's raw distribution over the offered goals, most likely first."""
+        if not self.probabilities:
+            return ""
+        ranked = sorted(self.probabilities.items(), key=lambda kv: -kv[1])
+        return ", ".join(f"{k}={v:.2f}" for k, v in ranked)
 
 
 def _sample_goal(
@@ -205,8 +213,9 @@ class JevAgent:
             "next_goal": Choice(
                 instructions={
                     "question": "Which goal should RED pursue next?",
-                    "focus": "Pick the ONE goal that best advances the objective given the screen text, "
-                    "nearby objects, walkability and room map. Code will execute the walking.",
+                    "focus": "Pick the ONE goal that best advances your long-term goal (badges/Champion) "
+                    "given the screen text, recent hints, nearby objects, walkability and room map. "
+                    "Code will execute the walking.",
                 },
                 criteria=criteria,
             )
@@ -221,15 +230,16 @@ class JevAgent:
         # pulls the peak down and keeps every option alive, so there is always
         # a real chance of doing something else. Overridable via env:
         #   TYPESAFE_TEMPERATURE (default 2.0; >1 flattens, <1 sharpens)
-        #   TYPESAFE_GOAL_FLOOR    (default 0.05; min mass kept per option)
+        #   TYPESAFE_GOAL_FLOOR    (default 0.1; min mass kept per option)
         temperature = float(os.getenv("TYPESAFE_TEMPERATURE", "2.0"))
-        floor = float(os.getenv("TYPESAFE_GOAL_FLOOR", "0.05"))
+        floor = float(os.getenv("TYPESAFE_GOAL_FLOOR", "0.1"))
         goal, conf = _sample_goal(choice.probabilities, temperature, floor)
         return GoalDecision(
             goal=goal,
             confidence=conf,
             nouls=nouls,
             menu_open=nouls.get("menu_open"),
+            probabilities=dict(choice.probabilities),
         )
 
     def decide_action(self, state: dict[str, Any]) -> Decision:

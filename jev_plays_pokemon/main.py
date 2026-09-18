@@ -22,8 +22,35 @@ from jev_plays_pokemon.agent import Decision, JevAgent, pick_action  # noqa: E40
 from jev_plays_pokemon.play import execute_goal  # noqa: E402
 from jev_plays_pokemon.state import StateBuilder, render_state_line, render_text_state  # noqa: E402
 from jev_plays_pokemon.vendor.emulator import PyBoyEmulator  # noqa: E402
+from jev_plays_pokemon.vendor.memory.red import MAP_NAMES  # noqa: E402
 
 log = logging.getLogger("jev_plays_pokemon")
+
+
+def _goal_label(goal: str, builder: StateBuilder) -> str:
+    """Human-readable label for a just-executed goal, for the model's recent-action memory.
+
+    The raw goal ids (``talk_to_3``, ``exit_to_37``) are opaque to the model;
+    this maps them to short, readable actions. ``desc`` exists on the goal but
+    is wordy ("Walk next to Mom at (5,7) (left 1) and talk to them..."), and six
+    of those would blow the token budget.
+    """
+    if goal.startswith("talk_to_"):
+        index = int(goal.rsplit("_", 1)[1])
+        objects = builder.objects or []
+        if index < len(objects) and objects[index].get("name"):
+            return f"talked to {objects[index]['name']}"
+        return "talked to someone"
+    if goal.startswith("exit_to_"):
+        dest = int(goal.removeprefix("exit_to_"))
+        return f"went to {MAP_NAMES.get(dest, f'map {dest}')}"
+    labels = {
+        "advance_text": "advanced the dialog",
+        "reach_exit": "searched for the exit",
+        "explore": "explored",
+        "wait": "waited",
+    }
+    return labels.get(goal, goal)
 
 
 def setup_logging(verbose: bool) -> Path:
@@ -117,9 +144,8 @@ def _unstuck(emu, builder, log) -> bool:
     # Last resort: hold each direction longer (catches slow animations).
     start = player_map(builder)
     for direction in ("up", "down", "left", "right"):
-        emu.press(direction, 30)
+        emu.press(direction, 30)  # press() holds for the frame count, then releases
         emu.tick(30)
-        emu.button_release(direction)
         if moved_from(start):
             return True
     return False
@@ -261,10 +287,17 @@ def run(
                 else:
                     goal = decision.goal
                     desc = next((g["desc"] for g in builder.goals if g["id"] == goal), "")
-                    log.info("  -> Jev(goal): %s (p=%.2f) — %s", goal, decision.confidence, desc)
+                    probs = decision.prob_line()
+                    log.info(
+                        "  -> Jev(goal): %s (p=%.2f) — %s%s",
+                        goal,
+                        decision.confidence,
+                        desc,
+                        f" [offered: {probs}]" if probs else "",
+                    )
                     reason = execute_goal(emu, builder, goal, state)
                     log.info("  -> goal %s done: %s", goal, reason)
-                    builder.memory.record(goal, reason)
+                    builder.memory.record(_goal_label(goal, builder), reason)
                     # Disincentivise re-running the same goal immediately: a
                     # futile explore ("stuck") or a failed exit should not be
                     # retried every single turn, forcing the model to vary.
